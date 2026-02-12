@@ -1,119 +1,164 @@
 import sys
 import os
+import re
+import io
+import cv2
+import pytesseract
+import numpy as np
+from typing import Dict, Any, Optional
+from googleapiclient.http import MediaIoBaseDownload
 
-# --- PATH FIX: Add project root to python path ---
-# This allows us to run this file directly from the terminal
+# PATH FIX
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 if project_root not in sys.path: sys.path.append(project_root)
-# -------------------------------------------------
 
-import io
-import cv2
-import numpy as np
-from googleapiclient.http import MediaIoBaseDownload
 from src.services.drive_manager import DriveManager
 
 class VisionEngine:
-    """
-    The 'Eye' of AURA.
-    Responsibilities:
-    1. Download files from Drive into Memory (RAM).
-    2. Pre-process images (Grayscale, Threshold) for high-accuracy OCR.
-    """
-    
-    def __init__(self):
-        self.drive = DriveManager() # We use the drive manager to get the service
+    PATTERNS = {
+        'upi_labeled': r'(?i)(?:UPI\s*Ref\.?\s*No|UTR|Transaction\s*ID|Txn\s*ID|Ref\s*No|Reference\s*ID|Bank\s*Ref|Ref\s*Number)[\s:\-\.]*([A-Z0-9]+)',
+        'upi_standalone': r'\b\d{12,25}\b',
+        'amount_strict': r'(?:₹|Rs\.?|INR)\s*[\.\-]?\s*([\d,]+\.?\d{0,2})',
+        # Removed 'T' from fuzzy to prevent Transaction ID matches
+        'amount_fuzzy': r'(?:<|\?|t|R|\|)\s*([\d,]+\.?\d{0,2})\b',
+        'date_text': r'(?i)(?:on\s+)?(\d{1,2})[\s\-\/]+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-\/,]+(\d{4})',
+    }
 
-    def download_file_to_memory(self, file_id: str, mime_type: str) -> np.ndarray:
-        """
-        Downloads a file from Google Drive directly into a NumPy array (OpenCV format).
-        Zero-Disk Policy: Data never touches the hard drive.
-        """
+    def __init__(self):
+        self.drive = DriveManager()
+        if os.path.exists('/opt/homebrew/bin/tesseract'):
+            pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
+
+    def download_file_to_memory(self, file_id: str) -> Optional[np.ndarray]:
         try:
             print(f"   [...] Downloading file ID: {file_id}...")
             request = self.drive.service.files().get_media(fileId=file_id)
             file_buffer = io.BytesIO()
             downloader = MediaIoBaseDownload(file_buffer, request)
-            
             done = False
-            while done is False:
-                status, done = downloader.next_chunk()
-            
-            # Reset buffer pointer to beginning
+            while done is False: status, done = downloader.next_chunk()
             file_buffer.seek(0)
-            
-            # Convert raw bytes to OpenCV Image
             file_bytes = np.asarray(bytearray(file_buffer.read()), dtype=np.uint8)
-            
-            # Decode image (handles JPG, PNG, WEBP)
             img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            
-            if img is None:
-                raise ValueError("Could not decode image data.")
-                
             return img
-            
         except Exception as e:
-            print(f"[ERROR] Download failed for {file_id}: {e}")
+            print(f"[ERROR] Download failed: {e}")
             return None
 
-    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """
-        Applies Computer Vision filters to make text readable.
-        Pipeline: Grayscale -> Gaussian Blur -> Otsu Thresholding.
-        """
-        if image is None: return None
-
-        # 1. Convert to Grayscale (Text doesn't need color)
+    def preprocess_image(self, image: np.ndarray) -> Dict[str, np.ndarray]:
+        if image is None: return {}
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # 2. Gaussian Blur (Removes noise/grain from bad phone cameras)
+        scale_percent = 200 
+        width = int(gray.shape[1] * scale_percent / 100)
+        height = int(gray.shape[0] * scale_percent / 100)
+        upscaled = cv2.resize(gray, (width, height), interpolation = cv2.INTER_AREA)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # 3. Adaptive Thresholding (Binarization)
-        # This turns the image into pure Black & White, separating text from background
-        processed = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-        
-        return processed
+        binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        inverted = cv2.bitwise_not(binary)
+        return {'original': image, 'upscaled': upscaled, 'binary': binary, 'inverted': inverted}
 
-# --- Unit Test ---
-if __name__ == "__main__":
-    print("--- Vision Engine Test (v1.1) ---")
-    
-    # 1. Initialize
-    try:
-        vision = VisionEngine()
-        dm = DriveManager()
-    except Exception as e:
-        print(f"[CRITICAL FAIL] Init error: {e}")
-        sys.exit(1)
-    
-    # 2. Get a real file to test
-    link = input("Enter Drive Link: ")
-    f_id = dm.extract_folder_id(link)
-    
-    if not f_id:
-        print("[FAIL] Invalid Link")
-        sys.exit()
+    def run_ocr(self, processed_images: Dict[str, np.ndarray]) -> str:
+        full_text = ""
+        cfg = r'--oem 3 --psm 6'
+        if 'upscaled' in processed_images:
+            full_text += pytesseract.image_to_string(processed_images['upscaled'], lang='eng', config=cfg) + "\n"
+        if 'inverted' in processed_images:
+            full_text += pytesseract.image_to_string(processed_images['inverted'], lang='eng', config=cfg) + "\n"
+        return full_text
 
-    print(f"[INFO] Scanning folder: {f_id}")
-    files = dm.list_files(f_id)
-    
-    if files:
-        target = files[0] # Pick the first file
-        print(f"[INFO] Target Selected: {target['name']} ({target['mime']})")
+    def validate_amount(self, val: float) -> bool:
+        """GLOBAL SAFETY CHECK: Rejects improbable donation amounts."""
+        # 1. Must be positive
+        # 2. Must be <= 2,00,000 (2 Lakhs)
+        # 3. Must not look like a year (2025, 2026)
+        if val <= 0: return False
+        if val > 200000: return False 
+        if val in [2024, 2025, 2026, 2027]: return False
+        return True
+
+    def extract_financials(self, text: str) -> Dict[str, Any]:
+        data = { 'amount': 0.0, 'utr': None, 'timestamp': None, 'extracted_text': text }
         
-        # 3. Download
-        raw_img = vision.download_file_to_memory(target['id'], target['mime'])
+        # --- 1. SANITIZATION (The Nuclear Option) ---
+        # Remove "Transaction ID T..." patterns BEFORE processing money
+        # matches 'T' followed by 8+ digits
+        clean_text = re.sub(r'T\d{8,}', ' ', text)
+
+        # --- 2. UTR EXTRACTION ---
+        utr_match = re.search(self.PATTERNS['upi_labeled'], text) # Use original text for UTR
+        if utr_match:
+            raw_id = utr_match.group(1)
+            data['utr'] = re.sub(r'[^A-Za-z0-9]', '', raw_id)
+        else:
+            all_long_digits = re.findall(self.PATTERNS['upi_standalone'], text)
+            if all_long_digits: data['utr'] = all_long_digits[0]
+
+        # --- 3. AMOUNT EXTRACTION (Using Clean Text + Validation) ---
+        found_amount = False
+
+        # Priority 1: Strict (₹500)
+        strict_matches = re.findall(self.PATTERNS['amount_strict'], clean_text)
+        clean_strict = []
+        for a in strict_matches:
+            try:
+                val = float(a.replace(',', ''))
+                if self.validate_amount(val): clean_strict.append(val)
+            except: pass
         
-        if raw_img is not None:
-            print(f"[SUCCESS] Image Loaded into RAM. Shape: {raw_img.shape}")
+        if clean_strict:
+            data['amount'] = max(clean_strict)
+            found_amount = True
+
+        # Priority 2: Fuzzy (<8)
+        if not found_amount:
+            fuzzy_matches = re.findall(self.PATTERNS['amount_fuzzy'], clean_text)
+            clean_fuzzy = []
+            for a in fuzzy_matches:
+                try:
+                    val = float(a.replace(',', ''))
+                    if self.validate_amount(val): clean_fuzzy.append(val)
+                except: pass
             
-            # 4. Process
-            clean_img = vision.preprocess_image(raw_img)
-            print("[SUCCESS] Image Pre-processed (Grayscale + Threshold applied).")
-            print(f"   - Original Size: {raw_img.size} bytes")
-            print(f"   - Processed Type: {clean_img.dtype}")
-    else:
-        print("[WARN] No files found in this folder to test.")
+            if clean_fuzzy:
+                data['amount'] = max(clean_fuzzy)
+                found_amount = True
+
+        # Priority 3: Fallback (Generic)
+        if not found_amount:
+            generic_matches = re.findall(r'\b(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)\b', clean_text)
+            clean_generic = []
+            for a in generic_matches:
+                try:
+                    val = float(a.replace(',', ''))
+                    if self.validate_amount(val): clean_generic.append(val)
+                except: pass
+            
+            if clean_generic:
+                data['amount'] = max(clean_generic)
+
+        # --- 4. DATE ---
+        date_match = re.search(self.PATTERNS['date_text'], text)
+        if date_match:
+            groups = date_match.groups()
+            day, month, year = groups[-3], groups[-2], groups[-1]
+            data['timestamp'] = f"{day} {month} {year}"
+        
+        # Validation Status
+        if data['utr'] and data['amount'] > 0:
+            data['status'] = 'SUCCESS'
+        elif data['amount'] > 0:
+            data['status'] = 'MANUAL_REVIEW'
+        elif data['utr']:
+            data['status'] = 'PARTIAL_FAIL'
+        else:
+            data['status'] = 'FAILED'
+
+        return data
+
+    def analyze_file(self, file_id: str) -> Dict[str, Any]:
+        img = self.download_file_to_memory(file_id)
+        if img is None: return {'status': 'FAILED', 'reason': 'Download Error'}
+        versions = self.preprocess_image(img)
+        raw_text = self.run_ocr(versions)
+        return self.extract_financials(raw_text)
