@@ -1,147 +1,145 @@
-import cv2
-import pytesseract
-import numpy as np
 import re
+import numpy as np
 from typing import Dict, Any
-from pytesseract import Output
+
+try:
+    from doctr.io import DocumentFile
+    from doctr.models import ocr_predictor
+    DOCTR_AVAILABLE = True
+except ImportError:
+    DOCTR_AVAILABLE = False
 
 class VisionEngine:
     """
-    VISION ENGINE v14.0 (The Eraser)
-    - DOUBLE-PASS OCR:
-      1. Find coordinates of dates/years/noise.
-      2. PAINT OVER them with white pixels.
-      3. Read the clean image to get pure amounts.
+    VISION ENGINE v21.0 (THE HAWK EYE)
+    Standard: Enterprise docTR
+    
+    CRITICAL FIXES:
+    1. HEADER EXCLUSION: Ignores Top 8% (Kills Battery '56%', Time '12:18').
+    2. SIZE PRIORITY: Selects the 'Largest' number visually (Kills tiny metadata).
+    3. SYMBOL LOCK: Prioritizes numbers next to '₹'.
     """
 
     def __init__(self):
-        # M4 Silicon Path
-        self.tesseract_cmd = '/opt/homebrew/bin/tesseract'
-        pytesseract.pytesseract.tesseract_cmd = self.tesseract_cmd
+        if DOCTR_AVAILABLE:
+            # Re-using the model you already downloaded
+            self.model = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True)
+        else:
+            self.model = None
+
+        self.rx_utr_strict = re.compile(r'\b\d{12}\b')
+        self.rx_date_trap = re.compile(r'^(25|26|27)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])')
 
     def process_file(self, file_stream, filename: str) -> Dict[str, Any]:
+        if not self.model:
+            return {'status': 'FAILED', 'reason': 'Library Missing', 'amount': 0.0, 'utr': None}
+
         try:
-            # 1. Load Image
-            file_bytes = np.asarray(bytearray(file_stream.read()), dtype=np.uint8)
-            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            if image is None: return {'status': 'FAILED', 'reason': 'Corrupt Image'}
-
-            # 2. Preprocess (Standard)
-            # Check Dark Mode
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            if np.mean(gray) < 127: gray = cv2.bitwise_not(gray) # Invert if dark
-            
-            # Upscale
-            scale = 2.0
-            processed = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            processed = cv2.threshold(processed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-
-            # 3. PASS 1: THE SCOUT (Find Noise)
-            d = pytesseract.image_to_data(processed, output_type=Output.DICT, config=r'--oem 3 --psm 6')
-            n_boxes = len(d['text'])
-            
-            # Create a copy to paint on
-            clean_image = processed.copy()
-            
-            # List of noise patterns to ERASE
-            noise_patterns = [
-                r'202[4-9]', # Years
-                r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', # Months
-                r'(PM|AM)', # Time
-                r'Paid',
-                r'seconds',
-                r'3290', # Bank Account
-                r'Success'
-            ]
-            
-            for i in range(n_boxes):
-                text = d['text'][i].strip()
-                if not text: continue
-                
-                # Check if this word is noise
-                is_noise = False
-                for pattern in noise_patterns:
-                    if re.search(pattern, text, re.IGNORECASE):
-                        is_noise = True
-                        break
-                
-                # If it's noise, PAINT IT WHITE
-                if is_noise:
-                    (x, y, w, h) = (d['left'][i], d['top'][i], d['width'][i], d['height'][i])
-                    # Draw a white rectangle over it
-                    cv2.rectangle(clean_image, (x, y), (x + w, y + h), (255, 255, 255), -1)
-
-            # 4. PASS 2: THE READER (Scan Clean Image)
-            # Now we scan the image where dates are literally deleted
-            clean_text = pytesseract.image_to_string(clean_image, lang='eng', config=r'--oem 3 --psm 6')
-            
-            # 5. Extract Data
-            return self._extract_data(clean_text, d) # Pass original data for UTR search
-
+            file_bytes = file_stream.read()
+            doc = DocumentFile.from_images(file_bytes)
+            result = self.model(doc)
+            return self._parse_semantic_layout(result)
         except Exception as e:
-            return {'status': 'FAILED', 'reason': str(e)}
+            return {'status': 'FAILED', 'reason': f"Error: {str(e)}", 'amount': 0.0, 'utr': None}
 
-    def _extract_data(self, clean_text: str, original_data: Dict) -> Dict[str, Any]:
-        data = {'amount': 0.0, 'utr': None, 'status': 'FAILED', 'reason': 'No Data'}
+    def _parse_semantic_layout(self, result) -> Dict[str, Any]:
+        page = result.pages[0]
+        h_page, w_page = page.dimensions
         
-        # --- PHASE 1: AMOUNT HUNT (On Clean Text) ---
-        # Cleanup
-        text = clean_text.replace('l', '1').replace('O', '0').replace('o', '0')
-        text = re.sub(r'(?i)(z|Z|t|T|\?|7|f)\s*(\d)', r'₹\2', text)
+        candidates_amt = []
+        candidates_utr = []
+
+        for block in page.blocks:
+            for line in block.lines:
+                text = " ".join([word.value for word in line.words])
+                text_clean = text.replace(' ', '').upper()
+                
+                # Geometry: ((x1, y1), (x2, y2))
+                # y_center is relative (0.0 = Top, 1.0 = Bottom)
+                y1 = line.geometry[0][1]
+                y2 = line.geometry[1][1]
+                y_center = (y1 + y2) / 2
+                
+                # Calculate Font Height (Relative to page)
+                font_height = y2 - y1
+
+                # --- 1. AMOUNT LOGIC ---
+                # RULE A: Header Exclusion (Ignore Top 8% - Battery/Time)
+                # RULE B: Amount Zone (Must be in Top 50%)
+                if 0.08 < y_center < 0.50:
+                    self._analyze_amount(text, font_height, candidates_amt)
+
+                # --- 2. UTR LOGIC ---
+                # Check for Labels "UTR", "REF", "TXN"
+                if any(x in text_clean for x in ["UTR", "REF", "TXN", "ID"]):
+                     digits = self.rx_utr_strict.findall(text_clean)
+                     for d in digits:
+                         if not self._is_date_trap(d):
+                             candidates_utr.append({'val': d, 'score': 1000})
+                else:
+                    # Raw 12-digit search
+                    digits = self.rx_utr_strict.findall(text_clean)
+                    for d in digits:
+                        if not self._is_date_trap(d):
+                            candidates_utr.append({'val': d, 'score': 50})
+
+        return self._synthesize(candidates_amt, candidates_utr)
+
+    def _analyze_amount(self, text, height, candidates):
+        """
+        Parses line for money. Scores based on Size + Symbol.
+        """
+        # 1. Hard Filter: Reject Timestamps/Dates
+        if any(x in text for x in [':', '/', '-']): return
+        if "202" in text and "₹" not in text: return
         
-        candidates = []
-        
-        # 1. Look for Symbol Matches (Strongest)
-        matches = re.findall(r'(?:₹|Rs|INR)\s*([\d,]+\.?\d{0,2})', text)
-        for m in matches:
-            try:
-                val = float(m.replace(',', ''))
-                if 1.0 <= val <= 200000.0: candidates.append(val)
-            except: pass
-            
-        # 2. Look for Naked Numbers
-        if not candidates:
-            nums = re.findall(r'\b(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)\b', text)
+        # 2. Extract Numbers
+        # Remove symbols to parse value
+        val_text = text.replace('₹', '').replace('Rs', '').replace(',', '').strip()
+        try:
+            nums = re.findall(r"[-+]?\d*\.\d+|\d+", val_text)
             for n in nums:
-                try:
-                    val = float(n.replace(',', ''))
-                    if 1.0 <= val <= 200000.0: candidates.append(val)
-                except: pass
+                val = float(n)
+                # Sanity Range
+                if 1.0 <= val <= 200000.0:
+                    # --- SCORING ALGORITHM ---
+                    # Base Score
+                    score = 10
+                    
+                    # Bonus 1: Currency Symbol (Huge Confidence)
+                    if '₹' in text or 'Rs' in text: 
+                        score += 500
+                    
+                    # Bonus 2: Font Size (The "Hawk Eye")
+                    # Amounts are usually the biggest text. 
+                    # We multiply height by 1000 to make it significant.
+                    score += (height * 1000)
+                    
+                    candidates.append({'val': val, 'score': score, 'text': text})
+        except: pass
 
-        if candidates:
-            data['amount'] = max(candidates)
+    def _is_date_trap(self, digit_str):
+        if digit_str.startswith('0000'): return True
+        return bool(self.rx_date_trap.match(digit_str))
 
-        # --- PHASE 2: UTR HUNT (Using Original Data) ---
-        # We use the original scan because we might have accidentally erased part of a UTR if it looked like a date
-        full_text = " ".join(original_data['text'])
-        
-        # Clean for regex
-        blob = re.sub(r'[^a-zA-Z0-9]', '', full_text)
-        
-        # Find 12 digits
-        utrs = re.findall(r'(\d{12})', blob)
-        for u in utrs:
-            if not u.startswith('0000') and not u.startswith('2026'):
-                data['utr'] = u
-                break
-        
-        # Fallback for PhonePe (T...)
-        if not data['utr']:
-            txn = re.search(r'T(\d{20,})', blob)
-            if txn: data['utr'] = txn.group(1)[-12:]
+    def _synthesize(self, cands_amt, cands_utr) -> Dict[str, Any]:
+        # Sort by Score (Highest First)
+        final_amt = 0.0
+        if cands_amt:
+            cands_amt.sort(key=lambda x: x['score'], reverse=True)
+            final_amt = cands_amt[0]['val']
+            
+        final_utr = None
+        if cands_utr:
+            cands_utr.sort(key=lambda x: x['score'], reverse=True)
+            final_utr = cands_utr[0]['val']
 
-        # --- FINAL STATUS ---
-        if data['utr'] and data['amount'] > 0:
-            data['status'] = 'SUCCESS'
-            data['reason'] = ''
-        elif data['amount'] > 0:
-            data['status'] = 'MANUAL_REVIEW'
-            data['reason'] = f"Found ₹{data['amount']} but UTR missing"
-        elif data['utr']:
-            data['status'] = 'PARTIAL_FAIL'
-            data['reason'] = f"Found UTR {data['utr']} but Amount unclear"
+        # Logic Matrix
+        if final_amt > 0 and final_utr:
+            return {'status': 'SUCCESS', 'amount': final_amt, 'utr': final_utr}
+        elif final_amt > 0:
+            return {'status': 'MANUAL_REVIEW', 'amount': final_amt, 'utr': None, 'reason': 'UTR missing'}
+        elif final_utr:
+            return {'status': 'MANUAL_REVIEW', 'amount': 0.0, 'utr': final_utr, 'reason': 'Amount unclear'}
         else:
-            data['status'] = 'FAILED'
-            data['reason'] = "Image quality low"
-
-        return data
+            return {'status': 'FAILED', 'amount': 0.0, 'utr': None, 'reason': 'No Readable Data'}

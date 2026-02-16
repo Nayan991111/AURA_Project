@@ -1,12 +1,11 @@
 import sys
 import os
+import time
 
-# --- PATH FIX V2 (ROBUST) ---
-# Get the directory containing this script (AURA_Project/src)
+# --- PATH FIX (CRITICAL FOR M4) ---
+# This ensures Python can find 'src' regardless of where you run the script from
 current_dir = os.path.dirname(os.path.abspath(__file__))
-# Get the project root (AURA_Project)
-project_root = os.path.dirname(current_dir)
-# Add root to Python's search path
+project_root = os.path.dirname(os.path.dirname(current_dir))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 # -----------------------------
@@ -14,79 +13,88 @@ if project_root not in sys.path:
 from src.services.vision_engine import VisionEngine
 
 def test_ocr_pipeline():
-    print("--- [DAY 4] VISION ENGINE DIAGNOSTICS ---")
+    print("--- [DAY 12] VISION ENGINE v15.0 DIAGNOSTICS ---")
+    print("[INIT] Booting 'The Guillotine' Engine on Apple Silicon...")
     
     # 1. Initialize
     try:
         engine = VisionEngine()
-        print("[OK] VisionEngine Initialized")
+        print("[OK] VisionEngine Loaded Successfully")
     except Exception as e:
         print(f"[FAIL] Could not init VisionEngine: {e}")
         return
 
     # 2. Input
-    raw_input = input("Enter a Google Drive Link (Folder or File) or ID: ").strip()
+    print("\n--- INPUT REQUIRED ---")
+    raw_input = input("Paste a Google Drive Link (Folder or File) or ID: ").strip()
     
     if not raw_input:
         print("[SKIP] No input provided.")
         return
 
-    # Smart ID Resolution
+    # 3. Smart ID Resolution (Using internal drive service if available, else raw)
     target_id = raw_input
-    
-    # 2a. Try to extract ID if it's a URL
-    # (We use the engine's internal drive instance helper)
-    extracted = engine.drive.extract_folder_id(raw_input)
-    if extracted:
-        target_id = extracted
+    if "drive.google.com" in raw_input:
+        # Simple extraction for the test script
+        if "folders/" in raw_input:
+            target_id = raw_input.split("folders/")[1].split("?")[0]
+        elif "id=" in raw_input:
+            target_id = raw_input.split("id=")[1].split("&")[0]
         print(f"[INFO] Extracted ID: {target_id}")
 
-    # 2b. Check if it's a Folder and Auto-Resolve an Image
-    print("[...] Checking if ID is a Folder...")
-    try:
-        # We attempt to list files. If target_id is a file, this usually returns empty or error, handled below.
-        files = engine.drive.list_files(target_id, recursive=False)
-        
-        # Check if we actually got a list of files back
-        if files and isinstance(files, list) and len(files) > 0:
-            print(f"[INFO] Detected FOLDER containing {len(files)} files.")
-            found_image = None
-            # Prioritize standard images over PDF for this test
-            for f in files:
-                if f['mime'] in ['image/jpeg', 'image/png', 'image/heic']:
-                    found_image = f
-                    break
-            
-            if found_image:
-                print(f"[INFO] Auto-selected image: {found_image['name']} ({found_image['id']})")
-                target_id = found_image['id']
-            else:
-                print("[WARN] Folder found, but contains no valid images (JPG/PNG).")
-    except Exception as e:
-        # If list_files fails, it's likely because target_id is already a FILE ID, not a folder.
-        # We ignore the error and proceed to analyze it as a file.
-        pass
-
-    # 3. Run Analysis
-    print(f"\n[...] Analyzing Target ID: {target_id}...")
-    result = engine.analyze_file(target_id)
-
-    # 4. Report
-    print("\n--- ANALYSIS REPORT ---")
-    status = result.get('status', 'UNKNOWN')
-    print(f"STATUS: {status}")
+    # 4. Run Analysis
+    print(f"\n[...] Downloading & Analyzing ID: {target_id}...")
     
-    if status == 'FAILED':
-        print(f"REASON: {result.get('reason')}")
-    else:
-        print(f"AMOUNT: ₹{result.get('amount')}")
-        print(f"UTR/ID: {result.get('utr')}")
-        print(f"DATE:   {result.get('timestamp')}")
+    # We need to simulate the Drive Download + Memory Stream for the engine
+    from src.services.drive_service import DriveService
+    ds = DriveService()
+    
+    try:
+        # Check if it is a folder (if so, pick the first image)
+        try:
+            # Try to see if it's a folder
+            files = ds.list_files_recursive(target_id)
+            if files:
+                print(f"[INFO] Target is a FOLDER with {len(files)} files.")
+                target_file = files[0]
+                print(f"[INFO] Testing first file: {target_file['name']}")
+                file_stream = ds.download_file_to_memory(target_file['id'])
+                filename = target_file['name']
+            else:
+                # Target is likely a file itself
+                print("[INFO] Target appears to be a direct file.")
+                file_stream = ds.download_file_to_memory(target_id)
+                filename = "Direct_Test_File.jpg"
+        except:
+            # Fallback: Treat as direct file
+            file_stream = ds.download_file_to_memory(target_id)
+            filename = "Direct_Test_File.jpg"
+
+        # EXECUTE v15.0 ENGINE
+        start_time = time.time()
+        result = engine.process_file(file_stream, filename)
+        duration = time.time() - start_time
+
+        # 5. Report
+        print("\n" + "="*40)
+        print(f"   VISION REPORT v15.0")
+        print("="*40)
+        print(f"⏱️  Time Taken: {duration:.3f}s")
+        print(f"📂 Filename:   {filename}")
+        print(f"📊 Status:     {result['status']}")
         
-    print("-" * 30)
-    print("RAW TEXT SAMPLE (First 100 chars):")
-    print(str(result.get('extracted_text', ''))[:100].replace('\n', ' '))
-    print("-" * 30)
+        if result['status'] == 'SUCCESS':
+             print(f"✅ Amount:     ₹{result['amount']}")
+             print(f"🔍 UTR:        {result['utr']}")
+        else:
+             print(f"❌ Reason:     {result.get('reason')}")
+             print(f"⚠️ Raw Amount: {result.get('amount')}")
+             print(f"⚠️ Raw UTR:    {result.get('utr')}")
+
+        print("="*40)
+
+    except Exception as e:
+        print(f"[CRITICAL FAIL] Test Script Crashed: {e}")
 
 if __name__ == "__main__":
     test_ocr_pipeline()
