@@ -1,84 +1,49 @@
 import sys
 import os
-import time
 
-# --- PATH FIX ---
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(os.path.dirname(current_dir))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+# Add project root to path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from src.services.vision_engine import VisionEngine
-from src.services.drive_service import DriveService
 
-def test_ocr_pipeline():
-    print("--- [DAY 12] VISION ENGINE v15.0 DIAGNOSTICS ---")
+def run_diagnostics(image_path):
+    # 1. Resolve Path
+    if not os.path.isabs(image_path):
+        # Check relative to current working directory
+        image_path = os.path.join(os.getcwd(), image_path)
+
+    print(f"--- DIAGNOSTICS TARGET: {os.path.basename(image_path)} ---")
     
-    # 1. Initialize
-    try:
-        engine = VisionEngine()
-        print("[OK] VisionEngine (The Guillotine) Loaded")
-        ds = DriveService()
-        print("[OK] DriveService Connected")
-    except Exception as e:
-        print(f"[FAIL] Init Error: {e}")
+    if not os.path.exists(image_path):
+        print(f"❌ CRITICAL: File not found at {image_path}")
+        print("   Tip: Drag the image into the terminal to get the full path.")
         return
 
-    # 2. Input
-    print("\n--- INPUT REQUIRED ---")
-    raw_input = input("Paste Google Drive Link/ID: ").strip()
-    if not raw_input: return
+    # 2. Init Engine
+    print("   [INIT] Loading docTR Model (ResNet-50)...")
+    engine = VisionEngine(debug_mode=True)
 
-    # 3. Resolve Target
-    target_id = raw_input
-    if "drive.google.com" in raw_input:
-        try:
-            target_id = ds.extract_folder_id(raw_input)
-        except:
-            pass
-            
-    print(f"[INFO] Target ID: {target_id}")
-
-    # 4. Download & Analyze
-    try:
-        # Check if it's a folder or file
-        try:
-            files = ds.list_files_recursive(target_id)
-            if files:
-                print(f"[INFO] Target is a FOLDER. Testing first file: {files[0]['name']}")
-                target_id = files[0]['id']
-                filename = files[0]['name']
-            else:
-                filename = "Direct_Test.jpg"
-        except:
-            filename = "Direct_Test.jpg"
-
-        print(f"[...] Downloading {filename}...")
-        file_stream = ds.download_file_to_memory(target_id)
-        
-        print(f"[...] Processing with v15.0 Engine...")
-        start = time.time()
-        result = engine.process_file(file_stream, filename)
-        duration = time.time() - start
-
-        # 5. Report
-        print("\n" + "="*40)
-        print(f"   VISION REPORT v15.0")
-        print("="*40)
-        print(f"⏱️  Time: {duration:.3f}s")
-        print(f"📊 Status: {result['status']}")
-        
-        if result['status'] == 'SUCCESS':
-             print(f"✅ Amount: ₹{result['amount']}")
-             print(f"🔍 UTR:    {result['utr']}")
-        else:
-             print(f"❌ Reason: {result.get('reason')}")
-             print(f"⚠️ Raw Amt: {result.get('amount')}")
-             print(f"⚠️ Raw UTR: {result.get('utr')}")
-        print("="*40)
-
-    except Exception as e:
-        print(f"[CRITICAL FAIL] {e}")
+    # 3. Process
+    with open(image_path, 'rb') as f:
+        print("   [EXEC] Scanning...")
+        result = engine.process_file(f, os.path.basename(image_path))
+    
+    # 4. Report
+    print("\n" + "="*40)
+    print(f"STATUS: {result['status']}")
+    if result['status'] == 'FAILED':
+        print(f"REASON: {result['reason']}")
+    else:
+        print(f"💰 AMOUNT: ₹{result['amount']}")
+        print(f"🆔 UTR   : {result['utr']}")
+    print("="*40 + "\n")
 
 if __name__ == "__main__":
-    test_ocr_pipeline()
+    # Allow passing filename as argument: python test_day4.py my_image.jpg
+    if len(sys.argv) > 1:
+        target_file = sys.argv[1]
+    else:
+        # Default fallback
+        target_file = "test_image.jpg"
+        
+    run_diagnostics(target_file)
