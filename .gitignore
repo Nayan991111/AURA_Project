@@ -1,7 +1,36 @@
+# --- Python & Environment ---
 venv/
 __pycache__/
-*.pickle
-.aura_tokens/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+pip-log.txt
+
+# --- PyInstaller (CRITICAL) ---
+# These contain the heavy compiled app and temp files
+build/
+dist/
+*.spec
+
+# --- AURA Specific Security (SECRETS) ---
+# GLOBAL RULES: Ignore these filenames anywhere in the project
 credentials.json
+token.json
+*.pickle
+*.log
+
+# Specific Paths (Redundant but safe)
+assets/config/credentials.json
 assets/config/token.json
+.aura_tokens/
+
+# --- macOS System Files ---
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# --- IDE Settings ---
+.vscode/
+.idea/
