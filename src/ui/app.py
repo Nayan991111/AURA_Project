@@ -1,10 +1,15 @@
+from src.services.updater_service import UpdaterService
 import customtkinter as ctk
 import threading
-import re  # <--- Added for the Counter Fix
+import re
 from typing import Any
 
-# Import the Controller
+# Core Services
 from src.services.audit_manager import AuditManager
+from src.services.profile_manager import ProfileManager
+
+# Views
+from src.ui.views.onboarding_view import OnboardingView
 
 # Configuration
 ctk.set_appearance_mode("Dark")
@@ -13,7 +18,7 @@ ctk.set_default_color_theme("blue")
 class AuraApp(ctk.CTk):
     """
     PROJECT AURA - MAIN INTERFACE
-    Standard: 1% SDE (Responsive, Async, Thread-Safe)
+    Standard: 1% SDE (Responsive, Async, Thread-Safe, View Router)
     """
     def __init__(self):
         super().__init__()
@@ -23,24 +28,70 @@ class AuraApp(ctk.CTk):
         self.geometry("1100x700")
         self.minsize(900, 600)
         
-        # Grid Layout (2 Columns: Sidebar, Main Area)
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-
-        # 2. Components
-        self._build_sidebar()
-        self._build_main_area()
-
-        # 3. Logic Core
+        # 2. Logic Core Setup
+        self.profile_manager = ProfileManager()
         self.audit_manager = AuditManager(
             log_callback=self.log_message, 
             finished_callback=self.on_audit_finished
         )
         self.is_running = False
 
+        # 3. Root Container for View Routing
+        self.container = ctk.CTkFrame(self, fg_color="transparent")
+        self.container.pack(fill="both", expand=True)
+
+        # 4. Trigger State Machine
+        self.route_initial_view()
+
+    # --- ROUTER LOGIC ---
+
+    def route_initial_view(self):
+        """State Machine: Decide which screen to show on boot."""
+        if not self.profile_manager.is_registered():
+            self.show_onboarding()
+        else:
+            self.show_dashboard()
+
+    def clear_container(self):
+        """Wipes the current view from the screen."""
+        for widget in self.container.winfo_children():
+            widget.destroy()
+
+    def show_onboarding(self):
+        """Renders the First-Launch Registration Screen."""
+        self.clear_container()
+        
+        # Configure container for a single centered view
+        self.container.grid_columnconfigure(0, weight=1)
+        self.container.grid_columnconfigure(1, weight=0)
+        self.container.grid_rowconfigure(0, weight=1)
+        
+        # Pass `self.show_dashboard` as the success callback
+        onboarding = OnboardingView(self.container, on_success=self.show_dashboard)
+        onboarding.grid(row=0, column=0, sticky="nsew")
+
+    def show_dashboard(self):
+        """Renders the Main Audit Interface."""
+        self.clear_container()
+        
+        # Setup Grid Layout (2 Columns: Sidebar, Main Area)
+        self.container.grid_columnconfigure(0, weight=0) # Sidebar
+        self.container.grid_columnconfigure(1, weight=1) # Main Dashboard
+        self.container.grid_rowconfigure(0, weight=1)
+        
+        self._build_sidebar()
+        self._build_main_area()
+
+        # --- NEW: TRIGGER OTA UPDATER ---
+        # Fires silently in the background after the UI loads
+        UpdaterService(current_version="12.1").check_for_updates(self)
+
+    # --- DASHBOARD UI BUILDERS ---
+
     def _build_sidebar(self):
         """The Left Control Panel"""
-        self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
+        # Note: Parent is now self.container
+        self.sidebar_frame = ctk.CTkFrame(self.container, width=200, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
         self.sidebar_frame.grid_rowconfigure(4, weight=1)
 
@@ -60,7 +111,8 @@ class AuraApp(ctk.CTk):
 
     def _build_main_area(self):
         """The Right Execution Dashboard"""
-        self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        # Note: Parent is now self.container
+        self.main_frame = ctk.CTkFrame(self.container, corner_radius=0, fg_color="transparent")
         self.main_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
         self.main_frame.grid_rowconfigure(2, weight=1) # Log expands
         self.main_frame.grid_columnconfigure(0, weight=1)
@@ -144,9 +196,6 @@ class AuraApp(ctk.CTk):
         self.after(0, self._update_log_ui, message)
 
     def _update_log_ui(self, message):
-        """
-        [FIXED] Robust Regex Parsing for Dashboard Counters
-        """
         self.console_log.configure(state="normal")
         self.console_log.insert("end", message + "\n")
         self.console_log.see("end") 
@@ -155,19 +204,13 @@ class AuraApp(ctk.CTk):
         # 1. Update Verified Amount
         if "[OK]" in message and "Verified" in message:
             try:
-                # Regex: Finds "₹" followed by optional space and then numbers/commas
-                # Matches: "₹200.0", "₹ 200", "₹1,200.50"
                 match = re.search(r'₹\s*([\d,]+\.?\d*)', message)
                 if match:
-                    # Clean commas before converting to float
                     amt = float(match.group(1).replace(',', ''))
-                    
-                    # Add to existing total
                     current_str = self.metric_verified.cget("text").replace("₹","").replace(",","")
                     new_total = float(current_str) + amt
                     self.metric_verified.configure(text=f"₹{new_total:,.2f}")
                     
-                    # Increment Total Scanned
                     current_count = int(self.metric_total.cget("text"))
                     self.metric_total.configure(text=str(current_count + 1))
             except Exception as e:

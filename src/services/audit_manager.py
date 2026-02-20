@@ -1,3 +1,4 @@
+from src.services.telemetry_service import TelemetryService
 import threading
 import time
 from src.services.drive_service import DriveService
@@ -5,10 +6,11 @@ from src.services.vision_engine import VisionEngine
 
 class AuditManager:
     """
-    TANK MODE MANAGER (Day 12 Final)
+    TANK MODE MANAGER (Day 12 Final + Day 15 Telemetry)
     - Sequential Processing (Safe for SSL)
     - Robust Error Handling
     - Thread-safe Callbacks
+    - Cloud Telemetry Hooked
     """
     def __init__(self, log_callback, finished_callback):
         self.log_callback = log_callback
@@ -149,3 +151,11 @@ class AuditManager:
         ]
         for line in report:
             self.log_callback(line)
+            
+        # --- DAY 15 TELEMETRY INJECTION ---
+        try:
+            # Using the Google Sheet ID from your test_connection.py
+            telemetry = TelemetryService(spreadsheet_id="1UWcUhHrJx6jokEaSOd-lVthecqvnLpiSKuFX2p5zuiQ")
+            telemetry.send_audit_summary(folder_name, s)
+        except Exception as e:
+            self.log_callback(f"[WARN] Telemetry initiation failed: {e}")
